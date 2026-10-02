@@ -3,7 +3,7 @@
 Panduan lengkap operasi: [OPERASI.md](OPERASI.md).
 
 API gateway minimal dengan Rust (tokio + hyper 1.x): reverse proxy, routing path prefix (longest match),
-dan load balancing berdasarkan persentase. Tanpa fitur lain.
+load balancing berdasarkan persentase, health check (aktif+pasif), retry gagal-connect, hot reload (SIGHUP), dan metrics Prometheus. Lihat OPERASI.md bagian 11.
 
 ## Build & test
 

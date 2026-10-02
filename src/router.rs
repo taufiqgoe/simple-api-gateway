@@ -2,18 +2,85 @@ use crate::config::{normalize_path, Config};
 use hyper::header::HeaderValue;
 use hyper::http::uri::{Authority, Scheme};
 use hyper::Uri;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use crate::metrics::Stats;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::OnceLock;
+use std::time::Instant;
 
 const SLOTS: usize = 100;
+
+/// Milidetik sejak proses mulai; dipakai untuk batas waktu ejeksi tanpa lock.
+fn now_ms() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
 
 pub struct Upstream {
     pub authority: Authority,
     pub host: HeaderValue,
+    pub stats: Stats,
+    /// Hasil probe aktif; tanpa `health_path` selalu true.
+    healthy: AtomicBool,
+    probe_failures: AtomicU32,
+    timeouts_in_row: AtomicU32,
+    ejected_until_ms: AtomicU64,
+}
+
+impl Upstream {
+    fn new(authority: Authority, host: HeaderValue) -> Upstream {
+        Upstream {
+            authority,
+            host,
+            stats: Stats::default(),
+            healthy: AtomicBool::new(true),
+            probe_failures: AtomicU32::new(0),
+            timeouts_in_row: AtomicU32::new(0),
+            ejected_until_ms: AtomicU64::new(0),
+        }
+    }
+
+    /// Ikut rotasi: lolos probe aktif dan tidak sedang dikeluarkan.
+    pub fn available(&self) -> bool {
+        self.healthy.load(Ordering::Relaxed) && now_ms() >= self.ejected_until_ms.load(Ordering::Relaxed)
+    }
+
+    /// Keluarkan dari rotasi selama `secs`; setelah itu request berikutnya mencoba lagi (half-open).
+    pub fn eject(&self, secs: u64) {
+        self.ejected_until_ms.store(now_ms() + secs * 1000, Ordering::Relaxed);
+        self.stats.ejections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn on_response(&self) {
+        self.timeouts_in_row.store(0, Ordering::Relaxed);
+        self.ejected_until_ms.store(0, Ordering::Relaxed);
+    }
+
+    /// Timeout menunggu header: dikeluarkan setelah `threshold` kali berturut-turut.
+    pub fn on_timeout(&self, threshold: u32, eject_secs: u64) {
+        if self.timeouts_in_row.fetch_add(1, Ordering::Relaxed) + 1 >= threshold {
+            self.timeouts_in_row.store(0, Ordering::Relaxed);
+            self.eject(eject_secs);
+        }
+    }
+
+    /// Hasil satu probe aktif. Mengembalikan `Some(status_baru)` bila status sehat/tidak berubah.
+    pub fn on_probe(&self, ok: bool, threshold: u32) -> Option<bool> {
+        if ok {
+            self.probe_failures.store(0, Ordering::Relaxed);
+            self.ejected_until_ms.store(0, Ordering::Relaxed);
+            (!self.healthy.swap(true, Ordering::Relaxed)).then_some(true)
+        } else if self.probe_failures.fetch_add(1, Ordering::Relaxed) + 1 >= threshold {
+            self.healthy.swap(false, Ordering::Relaxed).then_some(false)
+        } else {
+            None
+        }
+    }
 }
 
 pub struct Route {
     prefix: String,
     pub strip_prefix: bool,
+    pub health_path: Option<String>,
     upstreams: Box<[Upstream]>,
     /// Tabel 100 slot berisi indeks upstream, sudah diinterleave.
     table: [u8; SLOTS],
@@ -26,14 +93,45 @@ pub struct Router {
 }
 
 impl Route {
-    /// Pilih upstream sesuai persentase weight, tanpa lock.
+    pub fn prefix(&self) -> &str {
+        &self.prefix
+    }
+
+    pub fn upstreams(&self) -> &[Upstream] {
+        &self.upstreams
+    }
+
+    pub fn upstream(&self, index: usize) -> &Upstream {
+        &self.upstreams[index]
+    }
+
+    /// Pilih upstream sesuai persentase weight, tanpa lock. Upstream yang dikeluarkan dilewati ke slot
+    /// berikutnya (porsinya terbagi ke yang sehat); bila semua dikeluarkan, tetap pakai pilihan slot (fail-open).
     #[inline]
-    pub fn pick(&self) -> &Upstream {
+    pub fn pick(&self) -> usize {
         if self.upstreams.len() == 1 {
-            return &self.upstreams[0];
+            return 0;
         }
         let slot = self.next.fetch_add(1, Ordering::Relaxed) % SLOTS;
-        &self.upstreams[self.table[slot] as usize]
+        let first = self.table[slot] as usize;
+        if self.upstreams[first].available() {
+            return first;
+        }
+        (1..SLOTS)
+            .map(|d| self.table[(slot + d) % SLOTS] as usize)
+            .find(|&i| self.upstreams[i].available())
+            .unwrap_or(first)
+    }
+
+    /// Upstream lain yang tersedia untuk mengulang request setelah `failed` gagal connect.
+    pub fn pick_retry(&self, failed: usize) -> Option<usize> {
+        if self.upstreams.len() == 1 {
+            return None;
+        }
+        let slot = self.next.fetch_add(1, Ordering::Relaxed) % SLOTS;
+        (0..SLOTS)
+            .map(|d| self.table[(slot + d) % SLOTS] as usize)
+            .find(|&i| i != failed && self.upstreams[i].available())
     }
 }
 
@@ -52,6 +150,7 @@ impl Router {
             routes.push(Route {
                 prefix: normalize_path(&rc.path).to_owned(),
                 strip_prefix: rc.strip_prefix,
+                health_path: rc.health_path.clone(),
                 upstreams: upstreams.into_boxed_slice(),
                 table: build_table(&weights),
                 next: AtomicUsize::new(0),
@@ -59,6 +158,10 @@ impl Router {
         }
         routes.sort_by(|a, b| b.prefix.len().cmp(&a.prefix.len()));
         Ok(Router { routes: routes.into_boxed_slice() })
+    }
+
+    pub fn routes(&self) -> &[Route] {
+        &self.routes
     }
 
     /// Cari rute dengan longest prefix match pada batas segmen.
@@ -93,7 +196,7 @@ fn parse_upstream(url: &str) -> Result<Upstream, String> {
         return Err(format!("url '{url}': tidak boleh berisi path atau query"));
     }
     let host = HeaderValue::from_str(authority.as_str()).map_err(|e| e.to_string())?;
-    Ok(Upstream { authority, host })
+    Ok(Upstream::new(authority, host))
 }
 
 /// Smooth weighted round-robin untuk 100 slot: hasilnya tepat sesuai weight dan
@@ -137,7 +240,7 @@ routes:
 "#;
 
     fn host_of(r: &Route) -> String {
-        r.pick().authority.to_string()
+        r.upstream(r.pick()).authority.to_string()
     }
 
     #[test]
@@ -185,7 +288,7 @@ routes:
         let (route, _) = r.find("/api").unwrap();
         let mut a = 0;
         for _ in 0..10_000 {
-            if route.pick().authority.as_str() == "a:1" {
+            if route.upstream(route.pick()).authority.as_str() == "a:1" {
                 a += 1;
             }
         }
@@ -204,6 +307,67 @@ routes:
         for (i, n) in [50, 30, 20].iter().enumerate() {
             assert_eq!(t.iter().filter(|&&x| x as usize == i).count(), *n);
         }
+    }
+
+    #[test]
+    fn ejected_upstream_is_skipped_and_its_share_goes_to_the_healthy_one() {
+        let r = router(YAML);
+        let (route, _) = r.find("/api").unwrap();
+        route.upstream(0).eject(60);
+        assert!(!route.upstream(0).available());
+        for _ in 0..500 {
+            assert_eq!(route.pick(), 1);
+        }
+    }
+
+    #[test]
+    fn all_ejected_fails_open() {
+        let r = router(YAML);
+        let (route, _) = r.find("/api").unwrap();
+        route.upstream(0).eject(60);
+        route.upstream(1).eject(60);
+        let picks: std::collections::HashSet<_> = (0..200).map(|_| route.pick()).collect();
+        assert_eq!(picks.len(), 2, "fail-open harus tetap membagi sesuai tabel");
+    }
+
+    #[test]
+    fn retry_picks_another_available_upstream_only() {
+        let r = router(YAML);
+        let (route, _) = r.find("/api").unwrap();
+        assert_eq!(route.pick_retry(0), Some(1));
+        assert_eq!(route.pick_retry(1), Some(0));
+        route.upstream(1).eject(60);
+        assert_eq!(route.pick_retry(0), None);
+        let (single, _) = r.find("/api/something").unwrap();
+        assert_eq!(single.pick_retry(0), None);
+    }
+
+    #[test]
+    fn probe_threshold_and_recovery() {
+        let r = router(YAML);
+        let (route, _) = r.find("/api").unwrap();
+        let u = route.upstream(0);
+        assert_eq!(u.on_probe(false, 2), None);
+        assert!(u.available());
+        assert_eq!(u.on_probe(false, 2), Some(false));
+        assert!(!u.available());
+        assert_eq!(u.on_probe(false, 2), None, "tidak ada transisi ulang");
+        assert_eq!(u.on_probe(true, 2), Some(true));
+        assert!(u.available());
+    }
+
+    #[test]
+    fn timeouts_eject_only_after_threshold_in_a_row() {
+        let r = router(YAML);
+        let (route, _) = r.find("/api").unwrap();
+        let u = route.upstream(1);
+        u.on_timeout(2, 30);
+        assert!(u.available());
+        u.on_response();
+        u.on_timeout(2, 30);
+        assert!(u.available(), "respons sukses mereset hitungan");
+        u.on_timeout(2, 30);
+        assert!(!u.available());
     }
 
     #[test]

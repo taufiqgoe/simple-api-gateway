@@ -8,7 +8,58 @@ pub struct Config {
     pub listen: SocketAddr,
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
+    /// Listener admin (`/metrics`, `/healthz`, `/upstreams`); tanpa field ini listener tidak dibuka.
+    #[serde(default)]
+    pub admin_listen: Option<SocketAddr>,
+    /// Satu baris stdout per request: `METHOD path -> status upstream ms`.
+    #[serde(default)]
+    pub access_log: bool,
+    #[serde(default)]
+    pub health: HealthConfig,
     pub routes: Vec<RouteConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HealthConfig {
+    /// Jeda antar probe aktif (hanya rute dengan `health_path`).
+    #[serde(default = "two")]
+    pub interval_secs: u64,
+    #[serde(default = "two")]
+    pub probe_timeout_secs: u64,
+    /// Probe gagal / timeout berurutan sebelum upstream dikeluarkan dari rotasi.
+    #[serde(default = "two")]
+    pub fail_threshold: u32,
+    /// Lama upstream dikeluarkan setelah gagal connect (atau timeout berulang); lalu dicoba lagi.
+    #[serde(default = "ten")]
+    pub eject_secs: u64,
+    /// Body request sampai batas ini disangga di memori supaya gagal-connect bisa diulang ke upstream lain.
+    #[serde(default = "default_retry_body_limit")]
+    pub retry_body_limit_bytes: u64,
+}
+
+impl Default for HealthConfig {
+    fn default() -> Self {
+        HealthConfig {
+            interval_secs: 2,
+            probe_timeout_secs: 2,
+            fail_threshold: 2,
+            eject_secs: 10,
+            retry_body_limit_bytes: default_retry_body_limit(),
+        }
+    }
+}
+
+fn two<T: From<u8>>() -> T {
+    T::from(2)
+}
+
+fn ten() -> u64 {
+    10
+}
+
+fn default_retry_body_limit() -> u64 {
+    256 * 1024
 }
 
 #[derive(Debug, Deserialize)]
@@ -17,6 +68,9 @@ pub struct RouteConfig {
     pub path: String,
     #[serde(default)]
     pub strip_prefix: bool,
+    /// Path probe aktif (GET, sukses = 2xx) ke tiap upstream rute ini, mis. `/actuator/health`.
+    #[serde(default)]
+    pub health_path: Option<String>,
     pub upstreams: Vec<UpstreamConfig>,
 }
 
@@ -54,6 +108,10 @@ fn validate(cfg: &Config) -> Result<(), String> {
     if cfg.routes.is_empty() {
         return Err("routes tidak boleh kosong".into());
     }
+    let h = &cfg.health;
+    if h.interval_secs == 0 || h.probe_timeout_secs == 0 || h.fail_threshold == 0 || h.eject_secs == 0 {
+        return Err("health: interval_secs, probe_timeout_secs, fail_threshold, eject_secs harus > 0".into());
+    }
     for (i, r) in cfg.routes.iter().enumerate() {
         if !r.path.starts_with('/') {
             return Err(format!("routes[{i}]: path '{}' harus diawali '/'", r.path));
@@ -61,6 +119,11 @@ fn validate(cfg: &Config) -> Result<(), String> {
         let norm = normalize_path(&r.path);
         if cfg.routes[..i].iter().any(|p| normalize_path(&p.path) == norm) {
             return Err(format!("routes[{i}]: path '{}' duplikat", r.path));
+        }
+        if let Some(hp) = &r.health_path {
+            if !hp.starts_with('/') {
+                return Err(format!("routes[{i}] ({}): health_path '{hp}' harus diawali '/'", r.path));
+            }
         }
         if r.upstreams.is_empty() {
             return Err(format!("routes[{i}] ({}): upstreams tidak boleh kosong", r.path));
@@ -134,6 +197,28 @@ routes:
 
         let y = OK.replace("weight: 100", "weight: 100\n        wieght: 1");
         assert!(parse(&y).unwrap_err().contains("unknown field `wieght`"));
+    }
+
+    #[test]
+    fn health_admin_and_log_options_parse_with_defaults() {
+        let c = parse(OK).unwrap();
+        assert!(c.admin_listen.is_none() && !c.access_log);
+        assert_eq!((c.health.interval_secs, c.health.fail_threshold, c.health.eject_secs), (2, 2, 10));
+        let y = format!(
+            "admin_listen: '127.0.0.1:3001'\naccess_log: true\nhealth: {{interval_secs: 5, fail_threshold: 3}}\n{}",
+            OK.replace("  - path: /api\n", "  - path: /api\n    health_path: /health\n")
+        );
+        let c = parse(&y).unwrap();
+        assert_eq!(c.admin_listen.unwrap().port(), 3001);
+        assert!(c.access_log);
+        assert_eq!((c.health.interval_secs, c.health.fail_threshold), (5, 3));
+        assert_eq!(c.routes[1].health_path.as_deref(), Some("/health"));
+    }
+
+    #[test]
+    fn rejects_bad_health_values() {
+        assert!(parse(&format!("health: {{interval_secs: 0}}\n{OK}")).is_err());
+        assert!(parse(&OK.replace("  - path: /api\n", "  - path: /api\n    health_path: health\n")).is_err());
     }
 
     #[test]
