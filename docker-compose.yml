@@ -1,0 +1,17 @@
+services:
+  gateway:
+    build: .
+    platform: linux/amd64
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./config.yaml:/etc/gateway/config.yaml:ro
+    depends_on: [app-v1, app-v2]
+
+  app-v1:
+    image: hashicorp/http-echo
+    command: ["-listen=:8080", "-text=app-v1"]
+
+  app-v2:
+    image: hashicorp/http-echo
+    command: ["-listen=:8080", "-text=app-v2"]

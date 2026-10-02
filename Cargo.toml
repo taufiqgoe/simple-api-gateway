@@ -1,0 +1,22 @@
+[package]
+name = "simple-api-gateway"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "signal", "macros"] }
+hyper = { version = "1", features = ["http1", "server", "client"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio", "server-graceful"] }
+http-body-util = "0.1"
+serde = { version = "1", features = ["derive"] }
+# serde_yaml sudah tidak dirawat; serde_yaml_ng adalah fork yang aktif.
+serde_yaml_ng = "0.10"
+# Allocator bawaan musl lambat untuk workload multi-thread; mimalloc menggantikannya.
+mimalloc = { version = "0.1", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

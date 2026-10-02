@@ -1,0 +1,16 @@
+listen: "0.0.0.0:3000"
+timeout_secs: 30
+
+routes:
+  - path: /api/something
+    upstreams:
+      - url: http://app-v2:8080
+        weight: 100
+
+  - path: /api
+    strip_prefix: false
+    upstreams:
+      - url: http://app-v1:8080
+        weight: 80
+      - url: http://app-v2:8080
+        weight: 20
