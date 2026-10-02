@@ -20,6 +20,17 @@ GATEWAY_CONFIG=./config.yaml ./target/release/simple-api-gateway
 
 `GATEWAY_CONFIG` default `/etc/gateway/config.yaml`. Config dibaca sekali saat startup; config salah → exit 1 dengan pesan error.
 
+### Pull image dari Docker Hub
+
+```bash
+docker pull taufiqgoe/simple-api-gateway:latest   # atau :0.1.0
+docker run -d --name gateway -p 3000:3000 \
+  -v $(pwd)/config.yaml:/etc/gateway/config.yaml:ro \
+  taufiqgoe/simple-api-gateway:latest
+```
+
+Image `linux/amd64`. Config wajib di-mount ke `/etc/gateway/config.yaml`.
+
 ### Docker
 
 ```bash
