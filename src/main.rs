@@ -283,7 +283,12 @@ fn new_shared(cfg: &config::Config, router: Router) -> Arc<Shared> {
 }
 
 /// SIGHUP: baca ulang config; bila salah, config lama tetap berlaku. `listen`/`admin_listen` tidak berubah saat reload.
-async fn reload_on_sighup(app: Arc<App>, listen: std::net::SocketAddr, admin: Option<std::net::SocketAddr>) {
+async fn reload_on_sighup(
+    app: Arc<App>,
+    listen: std::net::SocketAddr,
+    admin: Option<std::net::SocketAddr>,
+    tls_listen: Option<std::net::SocketAddr>,
+) {
     use tokio::signal::unix::{signal, SignalKind};
     let mut hup = signal(SignalKind::hangup()).expect("pasang handler SIGHUP");
     while hup.recv().await.is_some() {
@@ -297,8 +302,8 @@ async fn reload_on_sighup(app: Arc<App>, listen: std::net::SocketAddr, admin: Op
                         _ => println!("peringatan: mengaktifkan/menonaktifkan tls butuh restart, diabaikan"),
                     }
                 }
-                if cfg.listen != listen || cfg.admin_listen != admin {
-                    println!("peringatan: perubahan listen/admin_listen butuh restart, diabaikan");
+                if cfg.listen != listen || cfg.admin_listen != admin || cfg.tls.as_ref().map(|t| t.listen) != tls_listen {
+                    println!("peringatan: perubahan listen/admin_listen/tls.listen butuh restart, diabaikan");
                 }
                 let fresh = new_shared(&cfg, router);
                 let old = std::mem::replace(&mut *app.current.write().unwrap(), fresh.clone());
@@ -357,6 +362,14 @@ async fn admin(app: Arc<App>, req: Request<Incoming>) -> Result<Response<Full<By
     Ok(r)
 }
 
+/// Accept pada listener opsional; tanpa listener, future ini tidak pernah selesai.
+async fn accept_opt(l: &Option<TcpListener>) -> std::io::Result<(tokio::net::TcpStream, std::net::SocketAddr)> {
+    match l {
+        Some(l) => l.accept().await,
+        None => std::future::pending().await,
+    }
+}
+
 async fn shutdown_signal() {
     use tokio::signal::unix::{signal, SignalKind};
     let mut term = signal(SignalKind::terminate()).expect("pasang handler SIGTERM");
@@ -391,6 +404,16 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    let tls_listener = match &cfg.tls {
+        Some(t) => match TcpListener::bind(t.listen).await {
+            Ok(l) => Some(l),
+            Err(e) => {
+                println!("error: tidak bisa listen tls di {}: {e}", t.listen);
+                std::process::exit(1);
+            }
+        },
+        None => None,
+    };
     let admin_listener = match cfg.admin_listen {
         Some(addr) => match TcpListener::bind(addr).await {
             Ok(l) => Some(l),
@@ -415,7 +438,7 @@ async fn main() {
         global: metrics::Global { no_route: AtomicU64::new(0), reloads: AtomicU64::new(0), reload_failures: AtomicU64::new(0) },
     });
     spawn_probes(&app, &shared);
-    tokio::spawn(reload_on_sighup(app.clone(), cfg.listen, cfg.admin_listen));
+    tokio::spawn(reload_on_sighup(app.clone(), cfg.listen, cfg.admin_listen, cfg.tls.as_ref().map(|t| t.listen)));
 
     if let Some(admin_listener) = admin_listener {
         let app = app.clone();
@@ -434,7 +457,7 @@ async fn main() {
     println!(
         "gateway listening on {}{} ({} routes{})",
         cfg.listen,
-        if cfg.tls.is_some() { " (tls)" } else { "" },
+        cfg.tls.as_ref().map(|t| format!(", tls {}", t.listen)).unwrap_or_default(),
         cfg.routes.len(),
         cfg.admin_listen.map(|a| format!(", admin {a}")).unwrap_or_default()
     );
@@ -445,19 +468,21 @@ async fn main() {
     tokio::pin!(shutdown);
 
     loop {
-        let (stream, peer) = tokio::select! {
-            r = listener.accept() => match r {
-                Ok(v) => v,
-                Err(e) => {
-                    println!("error: accept: {e}");
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                    continue;
-                }
-            },
+        let (r, is_tls) = tokio::select! {
+            r = listener.accept() => (r, false),
+            r = accept_opt(&tls_listener) => (r, true),
             _ = &mut shutdown => break,
         };
+        let (stream, peer) = match r {
+            Ok(v) => v,
+            Err(e) => {
+                println!("error: accept: {e}");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+        };
         let _ = stream.set_nodelay(true);
-        let acceptor = app.tls.read().unwrap().clone();
+        let acceptor = if is_tls { app.tls.read().unwrap().clone() } else { None };
         let app = app.clone();
         let ip = peer.ip();
         let svc = service_fn(move |req| proxy(app.clone(), ip, req));
@@ -483,7 +508,7 @@ async fn main() {
     }
 
     println!("shutting down...");
-    drop(listener);
+    drop((listener, tls_listener));
     app.shared().retired.store(true, Relaxed);
     if timeout(Duration::from_secs(cfg.timeout_secs), graceful.shutdown()).await.is_err() {
         println!("shutdown timeout, closing remaining connections");
