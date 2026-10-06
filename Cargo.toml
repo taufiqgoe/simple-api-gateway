@@ -1,6 +1,6 @@
 [package]
 name = "simple-api-gateway"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
@@ -12,6 +12,9 @@ serde = { version = "1", features = ["derive"] }
 # serde_yaml sudah tidak dirawat; serde_yaml_ng adalah fork yang aktif.
 serde_yaml_ng = "0.10"
 # Allocator bawaan musl lambat untuk workload multi-thread; mimalloc menggantikannya.
+# TLS termination: rustls (Rust murni, tanpa OpenSSL) dengan provider ring agar build musl tetap sederhana.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 mimalloc = { version = "0.1", default-features = false }
 
 [profile.release]

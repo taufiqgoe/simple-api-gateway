@@ -8,8 +8,9 @@ Ringkasan ada di [README.md](README.md).
 Gateway menerima HTTP/1.1 di satu port, mencocokkan path dengan daftar rute (longest prefix),
 memilih satu upstream sesuai persentase weight, lalu meneruskan request dan men-stream respons kembali.
 
-Batasan yang disengaja (tidak ada): TLS, auth, rate limiting, health check, hot reload, metrics,
-WebSocket/Upgrade, HTTP/2, access log. Lihat bagian 9.
+Fitur operasional (sejak 0.2.0): health check aktif + pasif, retry otomatis saat gagal connect, hot reload (SIGHUP),
+metrics Prometheus, dan access log opsional. Batasan yang disengaja (tidak ada): TLS, auth, rate limiting,
+WebSocket/Upgrade, HTTP/2. Lihat bagian 9 dan 11.
 
 ## 2. Menjalankan
 
@@ -264,10 +265,58 @@ Auth, rate limiting, TLS, health check, service discovery, hot reload, metrics, 
 WebSocket, HTTP/2, dan access log sengaja tidak ada. Untuk TLS, taruh gateway di belakang
 terminator TLS/load balancer (lalu perhatikan catatan `X-Forwarded-For` di atas).
 
+## 11. Health check, retry, reload, metrics (0.2.0)
+
+```yaml
+admin_listen: "0.0.0.0:3001"   # opsional; tanpa ini tidak ada listener admin
+access_log: false              # true = satu baris stdout per request
+health:                        # semua opsional (nilai default ditampilkan)
+  interval_secs: 2             # jeda probe aktif
+  probe_timeout_secs: 2
+  fail_threshold: 2            # probe gagal / timeout berurutan sebelum dikeluarkan
+  eject_secs: 10               # lama dikeluarkan setelah gagal connect / timeout berulang
+  retry_body_limit_bytes: 262144
+routes:
+  - path: /
+    health_path: /actuator/health   # opsional: probe aktif GET, sukses = 2xx
+    upstreams: [...]
+```
+
+- **Pasif (selalu aktif):** gagal *connect* ke upstream → langsung dikeluarkan `eject_secs`, lalu dicoba lagi (half-open).
+  Timeout menunggu header → dikeluarkan setelah `fail_threshold` kali berturut-turut. Respons upstream (termasuk 5xx) tidak dihitung gagal.
+- **Aktif:** hanya rute dengan `health_path`; `fail_threshold` probe gagal → keluar, satu probe sukses → masuk lagi.
+- **Pembagian saat ada yang keluar:** porsinya dibagi ke upstream sehat (lewat tabel slot). Bila semua keluar, gateway tetap mencoba (fail-open). Upstream tunggal tidak pernah dikeluarkan dari rute.
+- **Retry:** hanya untuk gagal *connect* (belum ada byte terkirim, jadi aman untuk POST), satu kali, ke upstream lain yang tersedia.
+  Body request ≤ `retry_body_limit_bytes` (dengan Content-Length) disangga di memori supaya bisa diulang; body lebih besar atau chunked di-stream tanpa retry.
+  Timeout dan error lain TIDAK diulang (request mungkin sudah diproses).
+- **Reload:** ubah `config.yaml` lalu `docker kill -s HUP <container>`. Config salah → ditolak, yang lama tetap dipakai
+  (`error: reload gagal...` di log). `listen`/`admin_listen` tidak berubah tanpa restart. Counter metrics ter-reset saat reload (Prometheus menangani reset).
+- **Admin** (`admin_listen`): `GET /healthz`, `GET /upstreams` (up/down tiap upstream), `GET /metrics` (Prometheus:
+  `gateway_requests_total`, `gateway_responses_total{class}`, `gateway_upstream_errors_total{kind}`, `gateway_retries_total`,
+  `gateway_ejections_total`, `gateway_upstream_up`, `gateway_request_duration_seconds` (histogram sampai header respons),
+  `gateway_no_route_total`, `gateway_config_reloads_total`). Jangan publish ke jaringan umum.
+
+## 12. TLS (HTTPS) pada listener
+
+```yaml
+tls:
+  cert: /etc/gateway/tls/fullchain.pem   # sertifikat server + intermediate (urutan: server dulu)
+  key: /etc/gateway/tls/privkey.pem      # PKCS#1 / PKCS#8 / SEC1
+```
+
+- Opsional. Tanpa blok `tls`, `listen` melayani HTTP biasa. Berlaku hanya untuk `listen`, bukan `admin_listen`.
+- Hanya TLS termination di sisi klien (TLS 1.2/1.3, ALPN `http/1.1`). Koneksi ke upstream tetap `http://`; tanpa mTLS.
+- Membuat fullchain dari file CA: `cat server.crt intermediate.crt > fullchain.pem`. Cert dan key harus berpasangan, kalau tidak gateway menolak start (exit 1).
+- Perpanjang sertifikat: ganti file di tempat yang sama lalu `docker kill -s HUP <container>`; koneksi baru memakai sertifikat baru.
+  Sertifikat/key rusak saat reload ditolak dan sertifikat lama tetap dipakai.
+  Mengaktifkan/menonaktifkan `tls` butuh restart.
+- Handshake dibatasi 10 detik. `X-Forwarded-For` tetap IP klien; upstream tidak tahu skema asli (tidak ada `X-Forwarded-Proto`).
+- Mount cert dengan volume read-only dan pastikan terbaca oleh UID 65534. **Jangan** commit atau bake key ke image (`*.key`, `*.pem`, `*.crt` ada di `.gitignore`).
+
 ## 10. Pengembangan
 
 ```bash
-cargo test                   # 12 unit test: config, longest prefix, batas segmen, strip_prefix, distribusi weight
+cargo test                   # 20 unit test: config, longest prefix, batas segmen, strip_prefix, distribusi weight
 cargo build --release        # profil: opt-level 3, LTO fat, panic=abort, strip
 ```
 
