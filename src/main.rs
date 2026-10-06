@@ -1,6 +1,7 @@
 mod config;
 mod metrics;
 mod router;
+mod tls;
 
 use http_body_util::{BodyExt, Either, Full, Limited};
 use hyper::body::{Bytes, Incoming};
@@ -37,6 +38,8 @@ struct Shared {
 
 struct App {
     current: RwLock<Arc<Shared>>,
+    /// Acceptor TLS aktif; di-swap saat reload agar sertifikat baru dipakai koneksi berikutnya.
+    tls: RwLock<Option<tokio_rustls::TlsAcceptor>>,
     client: Client<HttpConnector, Body>,
     global: metrics::Global,
 }
@@ -285,7 +288,15 @@ async fn reload_on_sighup(app: Arc<App>, listen: std::net::SocketAddr, admin: Op
     let mut hup = signal(SignalKind::hangup()).expect("pasang handler SIGHUP");
     while hup.recv().await.is_some() {
         match load() {
-            Ok((cfg, router)) => {
+            Ok((cfg, router, acceptor)) => {
+                {
+                    let mut slot = app.tls.write().unwrap();
+                    match (slot.is_some(), acceptor) {
+                        (true, Some(a)) => *slot = Some(a),
+                        (false, None) => {}
+                        _ => println!("peringatan: mengaktifkan/menonaktifkan tls butuh restart, diabaikan"),
+                    }
+                }
                 if cfg.listen != listen || cfg.admin_listen != admin {
                     println!("peringatan: perubahan listen/admin_listen butuh restart, diabaikan");
                 }
@@ -355,17 +366,18 @@ async fn shutdown_signal() {
     }
 }
 
-fn load() -> Result<(config::Config, Router), String> {
+fn load() -> Result<(config::Config, Router, Option<tokio_rustls::TlsAcceptor>), String> {
     let path = std::env::var("GATEWAY_CONFIG").unwrap_or_else(|_| "/etc/gateway/config.yaml".into());
     let yaml = std::fs::read_to_string(&path).map_err(|e| format!("tidak bisa membaca {path}: {e}"))?;
     let cfg = config::parse(&yaml).map_err(|e| format!("config {path}: {e}"))?;
     let router = Router::build(&cfg).map_err(|e| format!("config {path}: {e}"))?;
-    Ok((cfg, router))
+    let acceptor = cfg.tls.as_ref().map(tls::load).transpose().map_err(|e| format!("config {path}: {e}"))?;
+    Ok((cfg, router, acceptor))
 }
 
 #[tokio::main]
 async fn main() {
-    let (cfg, router) = match load() {
+    let (cfg, router, acceptor) = match load() {
         Ok(v) => v,
         Err(e) => {
             println!("error: {e}");
@@ -398,6 +410,7 @@ async fn main() {
     let shared = new_shared(&cfg, router);
     let app = Arc::new(App {
         current: RwLock::new(shared.clone()),
+        tls: RwLock::new(acceptor),
         client,
         global: metrics::Global { no_route: AtomicU64::new(0), reloads: AtomicU64::new(0), reload_failures: AtomicU64::new(0) },
     });
@@ -419,8 +432,9 @@ async fn main() {
     }
 
     println!(
-        "gateway listening on {} ({} routes{})",
+        "gateway listening on {}{} ({} routes{})",
         cfg.listen,
+        if cfg.tls.is_some() { " (tls)" } else { "" },
         cfg.routes.len(),
         cfg.admin_listen.map(|a| format!(", admin {a}")).unwrap_or_default()
     );
@@ -443,14 +457,29 @@ async fn main() {
             _ = &mut shutdown => break,
         };
         let _ = stream.set_nodelay(true);
+        let acceptor = app.tls.read().unwrap().clone();
         let app = app.clone();
         let ip = peer.ip();
         let svc = service_fn(move |req| proxy(app.clone(), ip, req));
-        let conn = http.serve_connection(TokioIo::new(stream), svc);
-        let conn = graceful.watch(conn);
-        tokio::spawn(async move {
-            let _ = conn.await;
-        });
+        match acceptor {
+            None => {
+                let conn = graceful.watch(http.serve_connection(TokioIo::new(stream), svc));
+                tokio::spawn(async move {
+                    let _ = conn.await;
+                });
+            }
+            Some(acceptor) => {
+                let watcher = graceful.watcher();
+                let http = http.clone();
+                tokio::spawn(async move {
+                    // Handshake dibatasi waktu agar klien lambat/macet tidak menahan koneksi selamanya.
+                    let Ok(Ok(tls_stream)) = timeout(Duration::from_secs(10), acceptor.accept(stream)).await else {
+                        return;
+                    };
+                    let _ = watcher.watch(http.serve_connection(TokioIo::new(tls_stream), svc)).await;
+                });
+            }
+        }
     }
 
     println!("shutting down...");

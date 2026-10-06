@@ -16,7 +16,19 @@ pub struct Config {
     pub access_log: bool,
     #[serde(default)]
     pub health: HealthConfig,
+    /// TLS termination pada `listen`. Tanpa blok ini gateway melayani HTTP biasa.
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
     pub routes: Vec<RouteConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TlsConfig {
+    /// PEM berisi sertifikat server diikuti sertifikat intermediate (fullchain).
+    pub cert: String,
+    /// PEM private key (PKCS#1, PKCS#8, atau SEC1).
+    pub key: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -107,6 +119,11 @@ fn validate(cfg: &Config) -> Result<(), String> {
     }
     if cfg.routes.is_empty() {
         return Err("routes tidak boleh kosong".into());
+    }
+    if let Some(t) = &cfg.tls {
+        if t.cert.is_empty() || t.key.is_empty() {
+            return Err("tls: cert dan key tidak boleh kosong".into());
+        }
     }
     let h = &cfg.health;
     if h.interval_secs == 0 || h.probe_timeout_secs == 0 || h.fail_threshold == 0 || h.eject_secs == 0 {
@@ -213,6 +230,16 @@ routes:
         assert!(c.access_log);
         assert_eq!((c.health.interval_secs, c.health.fail_threshold), (5, 3));
         assert_eq!(c.routes[1].health_path.as_deref(), Some("/health"));
+    }
+
+    #[test]
+    fn tls_block_parses_and_is_optional() {
+        assert!(parse(OK).unwrap().tls.is_none());
+        let c = parse(&format!("tls: {{cert: /c.pem, key: /k.pem}}\n{OK}")).unwrap();
+        assert_eq!(c.tls.unwrap().cert, "/c.pem");
+        assert!(parse(&format!("tls: {{cert: /c.pem}}\n{OK}")).is_err());
+        assert!(parse(&format!("tls: {{cert: '', key: /k.pem}}\n{OK}")).is_err());
+        assert!(parse(&format!("tls: {{cert: /c.pem, key: /k.pem, ca: x}}\n{OK}")).is_err());
     }
 
     #[test]

@@ -296,6 +296,23 @@ routes:
   `gateway_ejections_total`, `gateway_upstream_up`, `gateway_request_duration_seconds` (histogram sampai header respons),
   `gateway_no_route_total`, `gateway_config_reloads_total`). Jangan publish ke jaringan umum.
 
+## 12. TLS (HTTPS) pada listener
+
+```yaml
+tls:
+  cert: /etc/gateway/tls/fullchain.pem   # sertifikat server + intermediate (urutan: server dulu)
+  key: /etc/gateway/tls/privkey.pem      # PKCS#1 / PKCS#8 / SEC1
+```
+
+- Opsional. Tanpa blok `tls`, `listen` melayani HTTP biasa. Berlaku hanya untuk `listen`, bukan `admin_listen`.
+- Hanya TLS termination di sisi klien (TLS 1.2/1.3, ALPN `http/1.1`). Koneksi ke upstream tetap `http://`; tanpa mTLS.
+- Membuat fullchain dari file CA: `cat server.crt intermediate.crt > fullchain.pem`. Cert dan key harus berpasangan, kalau tidak gateway menolak start (exit 1).
+- Perpanjang sertifikat: ganti file di tempat yang sama lalu `docker kill -s HUP <container>`; koneksi baru memakai sertifikat baru.
+  Sertifikat/key rusak saat reload ditolak dan sertifikat lama tetap dipakai.
+  Mengaktifkan/menonaktifkan `tls` butuh restart.
+- Handshake dibatasi 10 detik. `X-Forwarded-For` tetap IP klien; upstream tidak tahu skema asli (tidak ada `X-Forwarded-Proto`).
+- Mount cert dengan volume read-only dan pastikan terbaca oleh UID 65534. **Jangan** commit atau bake key ke image (`*.key`, `*.pem`, `*.crt` ada di `.gitignore`).
+
 ## 10. Pengembangan
 
 ```bash
