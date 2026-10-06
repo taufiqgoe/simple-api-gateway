@@ -16,7 +16,7 @@ pub struct Config {
     pub access_log: bool,
     #[serde(default)]
     pub health: HealthConfig,
-    /// TLS termination pada `listen`. Tanpa blok ini gateway melayani HTTP biasa.
+    /// Listener HTTPS tambahan (TLS termination). Tanpa blok ini hanya HTTP pada `listen`.
     #[serde(default)]
     pub tls: Option<TlsConfig>,
     pub routes: Vec<RouteConfig>,
@@ -25,6 +25,8 @@ pub struct Config {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TlsConfig {
+    /// Alamat HTTPS. `listen` tetap HTTP biasa; keduanya dilayani bersamaan.
+    pub listen: SocketAddr,
     /// PEM berisi sertifikat server diikuti sertifikat intermediate (fullchain).
     pub cert: String,
     /// PEM private key (PKCS#1, PKCS#8, atau SEC1).
@@ -123,6 +125,9 @@ fn validate(cfg: &Config) -> Result<(), String> {
     if let Some(t) = &cfg.tls {
         if t.cert.is_empty() || t.key.is_empty() {
             return Err("tls: cert dan key tidak boleh kosong".into());
+        }
+        if t.listen == cfg.listen || Some(t.listen) == cfg.admin_listen {
+            return Err(format!("tls.listen {} bentrok dengan listen/admin_listen", t.listen));
         }
     }
     let h = &cfg.health;
@@ -235,11 +240,15 @@ routes:
     #[test]
     fn tls_block_parses_and_is_optional() {
         assert!(parse(OK).unwrap().tls.is_none());
-        let c = parse(&format!("tls: {{cert: /c.pem, key: /k.pem}}\n{OK}")).unwrap();
-        assert_eq!(c.tls.unwrap().cert, "/c.pem");
-        assert!(parse(&format!("tls: {{cert: /c.pem}}\n{OK}")).is_err());
-        assert!(parse(&format!("tls: {{cert: '', key: /k.pem}}\n{OK}")).is_err());
-        assert!(parse(&format!("tls: {{cert: /c.pem, key: /k.pem, ca: x}}\n{OK}")).is_err());
+        let c = parse(&format!("tls: {{listen: '0.0.0.0:3443', cert: /c.pem, key: /k.pem}}\n{OK}")).unwrap();
+        let t = c.tls.unwrap();
+        assert_eq!((t.listen.port(), t.cert.as_str()), (3443, "/c.pem"));
+        assert!(parse(&format!("tls: {{cert: /c.pem, key: /k.pem}}\n{OK}")).is_err()); // listen wajib
+        assert!(parse(&format!("tls: {{listen: '0.0.0.0:3443', cert: /c.pem}}\n{OK}")).is_err());
+        assert!(parse(&format!("tls: {{listen: '0.0.0.0:3443', cert: '', key: /k.pem}}\n{OK}")).is_err());
+        assert!(parse(&format!("tls: {{listen: '0.0.0.0:3443', cert: /c.pem, key: /k.pem, ca: x}}\n{OK}")).is_err());
+        // bentrok dengan listen (OK memakai 0.0.0.0:3000)
+        assert!(parse(&format!("tls: {{listen: '0.0.0.0:3000', cert: /c.pem, key: /k.pem}}\n{OK}")).is_err());
     }
 
     #[test]
