@@ -109,10 +109,11 @@ fn add_forwarded_for(h: &mut HeaderMap, peer: IpAddr) {
     }
 }
 
-async fn proxy(app: Arc<App>, peer: IpAddr, req: Request<Incoming>) -> Result<Response<Body>, Infallible> {
+async fn proxy(app: Arc<App>, peer: IpAddr, tls: bool, req: Request<Incoming>) -> Result<Response<Body>, Infallible> {
     let started = Instant::now();
     let shared = app.shared();
-    let Some((route, fwd_path)) = shared.router.find(req.uri().path()) else {
+    let host = req.headers().get(HOST).and_then(|v| v.to_str().ok()).or_else(|| req.uri().authority().map(|a| a.as_str()));
+    let Some((route, fwd_path)) = shared.router.find(host, tls, req.uri().path()) else {
         app.global.no_route.fetch_add(1, Relaxed);
         return Ok(status(StatusCode::NOT_FOUND, "Not Found\n"));
     };
@@ -173,7 +174,9 @@ async fn proxy(app: Arc<App>, peer: IpAddr, req: Request<Incoming>) -> Result<Re
         let mut builder = Request::builder().method(parts.method.clone()).uri(uri).version(Version::HTTP_11);
         if let Some(h) = builder.headers_mut() {
             *h = parts.headers.clone();
-            h.insert(HOST, up.host.clone());
+            if !route.preserve_host {
+                h.insert(HOST, up.host.clone());
+            }
         }
         let Ok(request) = builder.body(body) else {
             return Ok(status(StatusCode::BAD_GATEWAY, "Bad Gateway\n"));
@@ -331,7 +334,7 @@ async fn admin(app: Arc<App>, req: Request<Incoming>) -> Result<Response<Full<By
                 .iter()
                 .flat_map(|r| {
                     r.upstreams().iter().map(|u| metrics::UpstreamView {
-                        route: if r.prefix().is_empty() { "/" } else { r.prefix() },
+                        route: r.label(),
                         upstream: u.authority.to_string(),
                         up: u.available(),
                         stats: &u.stats,
@@ -346,7 +349,7 @@ async fn admin(app: Arc<App>, req: Request<Incoming>) -> Result<Response<Full<By
                 for u in r.upstreams() {
                     out.push_str(&format!(
                         "{} {} {}\n",
-                        if r.prefix().is_empty() { "/" } else { r.prefix() },
+                        r.label(),
                         u.authority,
                         if u.available() { "up" } else { "down" }
                     ));
@@ -485,7 +488,7 @@ async fn main() {
         let acceptor = if is_tls { app.tls.read().unwrap().clone() } else { None };
         let app = app.clone();
         let ip = peer.ip();
-        let svc = service_fn(move |req| proxy(app.clone(), ip, req));
+        let svc = service_fn(move |req| proxy(app.clone(), ip, is_tls, req));
         match acceptor {
             None => {
                 let conn = graceful.watch(http.serve_connection(TokioIo::new(stream), svc));

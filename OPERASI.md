@@ -317,6 +317,34 @@ tls:
 - Docker: petakan port, mis. `"443:3443"` untuk HTTPS dan `"48020:3000"` untuk HTTP. Mount cert read-only dan pastikan terbaca UID 65534.
   **Jangan** commit atau bake key ke image (`*.key`, `*.pem`, `*.crt` ada di `.gitignore`).
 
+## 13. Routing berdasarkan host (0.5.0)
+
+```yaml
+routes:
+  - host: api.cashlez.com          # domain persis
+    preserve_host: true            # teruskan header Host asli ke upstream (default false)
+    upstreams: [{ url: "http://api:8080", weight: 100 }]
+  - host: "*.cashlez.com"          # satu level subdomain
+    upstreams: [{ url: "http://web:8080", weight: 100 }]
+  - host: 192.168.90.46:8080       # IP (dan/atau port) juga bisa
+    path: /admin
+    upstreams: [{ url: "http://admin:8080", weight: 100 }]
+  - path: /                        # tanpa host = fallback untuk host apa pun
+    upstreams: [{ url: "http://default:8080", weight: 100 }]
+```
+
+- `host` dan `preserve_host` opsional; `path` kini default `/`. Config lama tanpa `host` berlaku apa adanya.
+- Urutan kekhususan: `host:port` > `host` > `*.wildcard:port` > `*.wildcard` > tanpa host. Di tiap tingkat berlaku longest prefix path.
+- Host dibandingkan tanpa membedakan huruf besar/kecil. Wildcard hanya satu label (`a.x.com`), bukan `x.com` dan bukan `a.b.x.com`.
+- Tanpa port di config = port apa pun. Dengan port = hanya port itu. Request tanpa port di header `Host` dianggap 80 di listener HTTP dan 443 di listener HTTPS.
+- Port yang dicocokkan adalah port yang diketik klien (header `Host`), bukan port bind gateway (mis. klien 443, gateway 3443).
+  Proxy/NAT lain di depan gateway yang mengubah `Host` akan membuat rute tidak cocok (404).
+- IPv6 ditulis `[::1]` atau `[::1]:8080`. Skema/path di `host` ditolak. Pasangan `host`+`path` duplikat ditolak.
+- Tanpa header `Host`, hanya rute tanpa host yang bisa cocok. Tidak ada yang cocok = 404.
+- Berdasarkan header `Host` dari klien (bukan SNI TLS) dan bisa dipalsukan: untuk pemisahan layanan, bukan batas keamanan.
+- `preserve_host: true`: upstream menerima `Host` asli (termasuk port yang diketik klien). Default: `Host` diganti ke alamat upstream.
+- Label `route` di `/metrics` dan `/upstreams`: rute tanpa host tetap `/path`; rute ber-host berbentuk `host[:port]/path`, mis. `*.cashlez.com/` atau `api.cashlez.com:8443/v1`.
+
 ## 10. Pengembangan
 
 ```bash

@@ -1,4 +1,4 @@
-use crate::config::{normalize_path, Config};
+use crate::config::{normalize_path, parse_host, split_host_port, Config, HostRule};
 use hyper::header::HeaderValue;
 use hyper::http::uri::{Authority, Scheme};
 use hyper::Uri;
@@ -78,6 +78,12 @@ impl Upstream {
 }
 
 pub struct Route {
+    host: Option<HostRule>,
+    /// Urutan kekhususan host (kecil = lebih spesifik): host+port, host, wildcard+port, wildcard, tanpa host.
+    rank: u8,
+    /// Label untuk metrics/log: path saja bila tanpa host, selain itu `host[:port]` + path.
+    label: String,
+    pub preserve_host: bool,
     prefix: String,
     pub strip_prefix: bool,
     pub health_path: Option<String>,
@@ -88,13 +94,13 @@ pub struct Route {
 }
 
 pub struct Router {
-    /// Terurut dari prefix terpanjang ke terpendek, sehingga kecocokan pertama = longest match.
+    /// Terurut dari host paling spesifik lalu prefix terpanjang, sehingga kecocokan pertama = yang terbaik.
     routes: Box<[Route]>,
 }
 
 impl Route {
-    pub fn prefix(&self) -> &str {
-        &self.prefix
+    pub fn label(&self) -> &str {
+        &self.label
     }
 
     pub fn upstreams(&self) -> &[Upstream] {
@@ -147,8 +153,23 @@ impl Router {
                 upstreams.push(up);
                 weights.push(u.weight);
             }
+            let host = rc.host.as_deref().map(parse_host).transpose().map_err(|e| format!("routes[{i}]: {e}"))?;
+            let prefix = normalize_path(&rc.path).to_owned();
+            let path_label = if prefix.is_empty() { "/" } else { prefix.as_str() };
+            let (rank, label) = match &host {
+                None => (4, path_label.to_owned()),
+                Some(h) => {
+                    let port = h.port.map(|p| format!(":{p}")).unwrap_or_default();
+                    let label = format!("{}{}{port}{path_label}", if h.wildcard { "*." } else { "" }, h.name);
+                    (u8::from(h.wildcard) * 2 + u8::from(h.port.is_none()), label)
+                }
+            };
             routes.push(Route {
-                prefix: normalize_path(&rc.path).to_owned(),
+                host,
+                rank,
+                label,
+                preserve_host: rc.preserve_host,
+                prefix,
                 strip_prefix: rc.strip_prefix,
                 health_path: rc.health_path.clone(),
                 upstreams: upstreams.into_boxed_slice(),
@@ -156,7 +177,7 @@ impl Router {
                 next: AtomicUsize::new(0),
             });
         }
-        routes.sort_by(|a, b| b.prefix.len().cmp(&a.prefix.len()));
+        routes.sort_by(|a, b| a.rank.cmp(&b.rank).then(b.prefix.len().cmp(&a.prefix.len())));
         Ok(Router { routes: routes.into_boxed_slice() })
     }
 
@@ -164,10 +185,21 @@ impl Router {
         &self.routes
     }
 
-    /// Cari rute dengan longest prefix match pada batas segmen.
+    /// Cari rute: host dulu (host+port > host > wildcard+port > wildcard > tanpa host), lalu longest prefix
+    /// pada batas segmen. `host` = header Host klien; `tls` menentukan port default (443/80) bila tak ditulis.
     /// Mengembalikan rute dan path yang harus diteruskan ke upstream.
-    pub fn find<'a, 'p>(&'a self, path: &'p str) -> Option<(&'a Route, &'p str)> {
+    pub fn find<'a, 'p>(&'a self, host: Option<&str>, tls: bool, path: &'p str) -> Option<(&'a Route, &'p str)> {
+        let req = host.map(|h| {
+            let (name, port) = split_host_port(h);
+            (name, port.unwrap_or(if tls { 443 } else { 80 }))
+        });
         for r in self.routes.iter() {
+            if let Some(rule) = &r.host {
+                match req {
+                    Some((name, port)) if host_matches(rule, name, port) => {}
+                    _ => continue,
+                }
+            }
             if let Some(rest) = path.strip_prefix(r.prefix.as_str()) {
                 // Batas segmen: sisa kosong atau diawali '/'. (prefix "" selalu lolos untuk path '/...')
                 if rest.is_empty() || rest.starts_with('/') {
@@ -184,6 +216,27 @@ impl Router {
         }
         None
     }
+
+    #[cfg(test)]
+    fn find_path<'a, 'p>(&'a self, path: &'p str) -> Option<(&'a Route, &'p str)> {
+        self.find(None, false, path)
+    }
+}
+
+/// Wildcard `*.x.com` cocok untuk tepat satu label di depan `x.com` (bukan `x.com` sendiri, bukan `a.b.x.com`).
+fn host_matches(rule: &HostRule, name: &str, port: u16) -> bool {
+    if rule.port.is_some_and(|p| p != port) {
+        return false;
+    }
+    if !rule.wildcard {
+        return name.eq_ignore_ascii_case(&rule.name);
+    }
+    let (n, suffix) = (name.len(), rule.name.len());
+    n > suffix + 1
+        && name.is_char_boundary(n - suffix)
+        && name.as_bytes()[n - suffix - 1] == b'.'
+        && name[n - suffix..].eq_ignore_ascii_case(&rule.name)
+        && !name[..n - suffix - 1].contains('.')
 }
 
 fn parse_upstream(url: &str) -> Result<Upstream, String> {
@@ -246,46 +299,46 @@ routes:
     #[test]
     fn longest_prefix_wins() {
         let r = router(YAML);
-        assert_eq!(host_of(r.find("/api/something/123").unwrap().0), "c:3");
-        assert_eq!(host_of(r.find("/api/something").unwrap().0), "c:3");
-        let (route, _) = r.find("/api/other").unwrap();
+        assert_eq!(host_of(r.find_path("/api/something/123").unwrap().0), "c:3");
+        assert_eq!(host_of(r.find_path("/api/something").unwrap().0), "c:3");
+        let (route, _) = r.find_path("/api/other").unwrap();
         assert!(matches!(host_of(route).as_str(), "a:1" | "b:2"));
-        assert!(r.find("/api").is_some());
+        assert!(r.find_path("/api").is_some());
     }
 
     #[test]
     fn matches_on_segment_boundary() {
         let r = router(YAML);
-        assert!(r.find("/apix").is_none());
-        assert!(r.find("/api2/x").is_none());
+        assert!(r.find_path("/apix").is_none());
+        assert!(r.find_path("/api2/x").is_none());
         // /api/somethingelse jatuh ke /api, bukan /api/something
-        let (route, _) = r.find("/api/somethingelse").unwrap();
+        let (route, _) = r.find_path("/api/somethingelse").unwrap();
         assert!(!route.strip_prefix);
-        assert!(r.find("/other").is_none());
-        assert!(r.find("/").is_none());
+        assert!(r.find_path("/other").is_none());
+        assert!(r.find_path("/").is_none());
     }
 
     #[test]
     fn root_route_matches_everything() {
         let r = router("routes:\n  - path: /\n    upstreams:\n      - {url: 'http://a:1', weight: 100}\n");
-        assert!(r.find("/").is_some());
-        assert!(r.find("/anything/here").is_some());
+        assert!(r.find_path("/").is_some());
+        assert!(r.find_path("/anything/here").is_some());
     }
 
     #[test]
     fn strip_prefix_rewrites_path() {
         let r = router(YAML);
-        assert_eq!(r.find("/api/something/123").unwrap().1, "/123");
-        assert_eq!(r.find("/api/something").unwrap().1, "/");
-        assert_eq!(r.find("/api/something/").unwrap().1, "/");
+        assert_eq!(r.find_path("/api/something/123").unwrap().1, "/123");
+        assert_eq!(r.find_path("/api/something").unwrap().1, "/");
+        assert_eq!(r.find_path("/api/something/").unwrap().1, "/");
         // tanpa strip_prefix path tidak berubah
-        assert_eq!(r.find("/api/x").unwrap().1, "/api/x");
+        assert_eq!(r.find_path("/api/x").unwrap().1, "/api/x");
     }
 
     #[test]
     fn weight_distribution_matches_percentages() {
         let r = router(YAML);
-        let (route, _) = r.find("/api").unwrap();
+        let (route, _) = r.find_path("/api").unwrap();
         let mut a = 0;
         for _ in 0..10_000 {
             if route.upstream(route.pick()).authority.as_str() == "a:1" {
@@ -312,7 +365,7 @@ routes:
     #[test]
     fn ejected_upstream_is_skipped_and_its_share_goes_to_the_healthy_one() {
         let r = router(YAML);
-        let (route, _) = r.find("/api").unwrap();
+        let (route, _) = r.find_path("/api").unwrap();
         route.upstream(0).eject(60);
         assert!(!route.upstream(0).available());
         for _ in 0..500 {
@@ -323,7 +376,7 @@ routes:
     #[test]
     fn all_ejected_fails_open() {
         let r = router(YAML);
-        let (route, _) = r.find("/api").unwrap();
+        let (route, _) = r.find_path("/api").unwrap();
         route.upstream(0).eject(60);
         route.upstream(1).eject(60);
         let picks: std::collections::HashSet<_> = (0..200).map(|_| route.pick()).collect();
@@ -333,19 +386,19 @@ routes:
     #[test]
     fn retry_picks_another_available_upstream_only() {
         let r = router(YAML);
-        let (route, _) = r.find("/api").unwrap();
+        let (route, _) = r.find_path("/api").unwrap();
         assert_eq!(route.pick_retry(0), Some(1));
         assert_eq!(route.pick_retry(1), Some(0));
         route.upstream(1).eject(60);
         assert_eq!(route.pick_retry(0), None);
-        let (single, _) = r.find("/api/something").unwrap();
+        let (single, _) = r.find_path("/api/something").unwrap();
         assert_eq!(single.pick_retry(0), None);
     }
 
     #[test]
     fn probe_threshold_and_recovery() {
         let r = router(YAML);
-        let (route, _) = r.find("/api").unwrap();
+        let (route, _) = r.find_path("/api").unwrap();
         let u = route.upstream(0);
         assert_eq!(u.on_probe(false, 2), None);
         assert!(u.available());
@@ -359,7 +412,7 @@ routes:
     #[test]
     fn timeouts_eject_only_after_threshold_in_a_row() {
         let r = router(YAML);
-        let (route, _) = r.find("/api").unwrap();
+        let (route, _) = r.find_path("/api").unwrap();
         let u = route.upstream(1);
         u.on_timeout(2, 30);
         assert!(u.available());
@@ -376,5 +429,75 @@ routes:
             let y = format!("routes:\n  - path: /\n    upstreams:\n      - {{url: '{bad}', weight: 100}}\n");
             assert!(Router::build(&config::parse(&y).unwrap()).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn host_routing_priority_and_matching() {
+        let r = router(
+            "routes:
+  - {path: /, upstreams: [{url: 'http://fallback:1', weight: 100}]}
+  - {host: '*.cashlez.com', path: /, upstreams: [{url: 'http://wild:1', weight: 100}]}
+  - {host: api.cashlez.com, path: /, upstreams: [{url: 'http://exact:1', weight: 100}]}
+  - {host: api.cashlez.com, path: /v1, upstreams: [{url: 'http://exactv1:1', weight: 100}]}
+  - {host: 'api.cashlez.com:8443', path: /, upstreams: [{url: 'http://exactport:1', weight: 100}]}
+  - {host: 192.168.90.46, path: /, upstreams: [{url: 'http://ip:1', weight: 100}]}
+  - {host: '192.168.90.46:8080', path: /, upstreams: [{url: 'http://ipport:1', weight: 100}]}
+",
+        );
+        let up = |h: Option<&str>, tls: bool, p: &str| host_of(r.find(h, tls, p).unwrap().0);
+        assert_eq!(up(Some("api.cashlez.com"), false, "/x"), "exact:1");
+        assert_eq!(up(Some("API.Cashlez.COM"), false, "/v1/x"), "exactv1:1"); // case-insensitive + longest prefix
+        assert_eq!(up(Some("api.cashlez.com:443"), true, "/x"), "exact:1"); // port bukan 8443
+        assert_eq!(up(Some("api.cashlez.com:8443"), true, "/x"), "exactport:1"); // host+port menang
+        assert_eq!(up(Some("api.cashlez.com:8443"), true, "/v1/x"), "exactport:1"); // lebih spesifik dari path
+        assert_eq!(up(Some("app.cashlez.com"), false, "/x"), "wild:1");
+        assert_eq!(up(Some("a.b.cashlez.com"), false, "/x"), "fallback:1"); // wildcard satu level
+        assert_eq!(up(Some("cashlez.com"), false, "/x"), "fallback:1"); // apex bukan wildcard
+        assert_eq!(up(Some("evilcashlez.com"), false, "/x"), "fallback:1");
+        assert_eq!(up(Some("192.168.90.46"), false, "/x"), "ip:1");
+        assert_eq!(up(Some("192.168.90.46:9999"), false, "/x"), "ip:1"); // tanpa port di config = port apa pun
+        assert_eq!(up(Some("192.168.90.46:8080"), false, "/x"), "ipport:1");
+        assert_eq!(up(Some("unknown.example"), false, "/x"), "fallback:1");
+        assert_eq!(up(None, false, "/x"), "fallback:1"); // tanpa Host hanya rute tanpa host
+    }
+
+    #[test]
+    fn host_default_port_depends_on_listener() {
+        let r = router(
+            "routes:
+  - {host: 'x.com:443', path: /, upstreams: [{url: 'http://https:1', weight: 100}]}
+  - {host: 'x.com:80', path: /, upstreams: [{url: 'http://http:1', weight: 100}]}
+",
+        );
+        assert_eq!(host_of(r.find(Some("x.com"), true, "/").unwrap().0), "https:1");
+        assert_eq!(host_of(r.find(Some("x.com"), false, "/").unwrap().0), "http:1");
+        assert!(r.find(Some("x.com:8080"), false, "/").is_none());
+    }
+
+    #[test]
+    fn no_host_routes_only_when_no_fallback() {
+        let r = router("routes:\n  - {host: a.com, path: /, upstreams: [{url: 'http://a:1', weight: 100}]}\n");
+        assert!(r.find(Some("b.com"), false, "/").is_none());
+        assert!(r.find(None, false, "/").is_none());
+    }
+
+    #[test]
+    fn ipv6_host() {
+        let r = router("routes:\n  - {host: '[::1]:8080', path: /, upstreams: [{url: 'http://a:1', weight: 100}]}\n");
+        assert!(r.find(Some("[::1]:8080"), false, "/").is_some());
+        assert!(r.find(Some("[::1]:9"), false, "/").is_none());
+    }
+
+    #[test]
+    fn labels_and_preserve_host() {
+        let r = router(
+            "routes:
+  - {path: /, upstreams: [{url: 'http://a:1', weight: 100}]}
+  - {host: '*.x.com:8443', path: /v1/, preserve_host: true, upstreams: [{url: 'http://b:1', weight: 100}]}
+",
+        );
+        let labels: Vec<_> = r.routes().iter().map(|x| x.label().to_owned()).collect();
+        assert_eq!(labels, ["*.x.com:8443/v1", "/"]);
+        assert!(r.routes()[0].preserve_host && !r.routes()[1].preserve_host);
     }
 }
